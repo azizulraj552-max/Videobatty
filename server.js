@@ -24,7 +24,7 @@ const { initDB, loadDB, saveDB } = require('./db');
 const app = express();
 app.set('trust proxy', 1);
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' })); // ছবি আপলোডের জন্য বড় লিমিট
 
 const PORT = process.env.PORT || 4100;
 const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_THIS_SECRET_BEFORE_DEPLOYING';
@@ -83,7 +83,10 @@ function publicUser(u) {
     coins: u.coins, adsWatched: u.adsWatched || 0,
     takaValue: Math.floor((u.coins / COINS_TO_TAKA_RATE) * TAKA_PER_2000_COINS),
     referralCode: u.referralCode,
-    loginStreak: u.loginStreak || 0
+    loginStreak: u.loginStreak || 0,
+    avatarBase64: u.avatarBase64 || null,
+    language: u.language || 'bn',
+    customVideos: u.customVideos || []
   };
 }
 
@@ -118,6 +121,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     referralCode: newReferralCode, referredBy, referralBonusGiven: false,
     loginStreak: 1, lastLoginDate: taToday(),
     dailyBonusClaimedDate: null,
+    customVideos: [], // ইউজার নিজে যোগ করা ভিডিও লিংক
     createdAt: new Date().toISOString()
   };
   db.users.push(user);
@@ -203,6 +207,63 @@ app.post('/api/daily-bonus', authRequired, async (req, res) => {
   user.dailyBonusClaimedDate = today;
   await saveDB(db);
   res.json({ alreadyClaimed: false, bonus, streak: user.loginStreak, user: publicUser(user) });
+});
+
+// ================= প্রোফাইল ছবি আপলোড =================
+// ⚠️ ছবি MongoDB ডকুমেন্টেই base64 আকারে থাকে (আলাদা ইমেজ CDN নেই)।
+// তাই ক্লায়েন্ট-সাইডে ছোট (≤150px) ও কম্প্রেসড করে পাঠানো হয় (index.html দেখুন)।
+// ইউজার সংখ্যা অনেক বেশি (কয়েক হাজার+) হলে ভবিষ্যতে Cloudinary/S3-এর
+// মতো আলাদা ইমেজ স্টোরেজে সরানো ভালো হবে।
+app.post('/api/me/avatar', authRequired, async (req, res) => {
+  const { imageBase64 } = req.body;
+  if (!imageBase64 || !imageBase64.startsWith('data:image/')) return res.status(400).json({ error: 'ভুল ছবি ফরম্যাট' });
+  if (imageBase64.length > 300000) return res.status(400).json({ error: 'ছবি অনেক বড়, ছোট করে আবার চেষ্টা করুন' });
+  const db = await loadDB();
+  const user = db.users.find(u => u.id === req.userId);
+  if (!user) return res.status(404).json({ error: 'ইউজার পাওয়া যায়নি' });
+  user.avatarBase64 = imageBase64;
+  await saveDB(db);
+  res.json({ user: publicUser(user) });
+});
+
+app.post('/api/me/language', authRequired, async (req, res) => {
+  const { language } = req.body;
+  if (!['bn', 'en'].includes(language)) return res.status(400).json({ error: 'ভুল ভাষা কোড' });
+  const db = await loadDB();
+  const user = db.users.find(u => u.id === req.userId);
+  if (!user) return res.status(404).json({ error: 'ইউজার পাওয়া যায়নি' });
+  user.language = language;
+  await saveDB(db);
+  res.json({ user: publicUser(user) });
+});
+
+// ================= ইউজার নিজের ভিডিও লিংক যোগ করা =================
+// ⚠️ শুধু পাবলিক ভিডিওর লিংক কাজ করবে (private/restricted ভিডিও embed হবে না,
+// এটা YouTube/TikTok/Facebook-এর নিজস্ব সীমাবদ্ধতা, আমাদের কোডের সমস্যা না)।
+const MAX_CUSTOM_VIDEOS = 15;
+app.post('/api/me/videos', authRequired, async (req, res) => {
+  const { platform, url, title } = req.body;
+  if (!['youtube', 'tiktok', 'facebook'].includes(platform)) return res.status(400).json({ error: 'ভুল প্ল্যাটফর্ম' });
+  if (!url || !url.trim()) return res.status(400).json({ error: 'ভিডিও লিংক দিন' });
+
+  const db = await loadDB();
+  const user = db.users.find(u => u.id === req.userId);
+  if (!user) return res.status(404).json({ error: 'ইউজার পাওয়া যায়নি' });
+  if (!user.customVideos) user.customVideos = [];
+  if (user.customVideos.length >= MAX_CUSTOM_VIDEOS) return res.status(400).json({ error: `সর্বোচ্চ ${MAX_CUSTOM_VIDEOS}টা ভিডিও যোগ করা যাবে` });
+
+  user.customVideos.push({ id: uuidv4(), platform, url: url.trim(), title: (title || 'আমার ভিডিও').trim(), addedAt: new Date().toISOString() });
+  await saveDB(db);
+  res.json({ user: publicUser(user) });
+});
+
+app.delete('/api/me/videos/:id', authRequired, async (req, res) => {
+  const db = await loadDB();
+  const user = db.users.find(u => u.id === req.userId);
+  if (!user) return res.status(404).json({ error: 'ইউজার পাওয়া যায়নি' });
+  user.customVideos = (user.customVideos || []).filter(v => v.id !== req.params.id);
+  await saveDB(db);
+  res.json({ user: publicUser(user) });
 });
 
 // ================= AdMob Server-Side Verification (SSV) =================
